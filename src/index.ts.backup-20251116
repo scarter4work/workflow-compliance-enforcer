@@ -1,0 +1,475 @@
+#!/usr/bin/env node
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import { execSync } from 'child_process';
+
+// Workflow state management
+interface WorkflowState {
+  state: string;
+  activeIssue: number | null;
+  lastTestResult: any;
+  commitHash: string | null;
+  deploymentId: string | null;
+}
+
+let workflow: WorkflowState = {
+  state: 'NO_ACTIVE_ISSUE',
+  activeIssue: null,
+  lastTestResult: null,
+  commitHash: null,
+  deploymentId: null
+};
+
+// Helper to truncate long output
+function truncateOutput(output: string, maxLength: number = 10000): string {
+  if (output.length <= maxLength) {
+    return output;
+  }
+  const truncated = output.substring(0, maxLength);
+  return truncated + `\n\n... [output truncated, ${output.length - maxLength} more characters]`;
+}
+
+const server = new Server(
+  {
+    name: 'workflow-enforcer',
+    version: '1.0.0',
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
+
+// Define available tools
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'workflow_start_issue',
+      description: 'Begin work on a GitHub issue. REQUIRED before writing any code.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          issue_number: {
+            type: 'number',
+            description: 'GitHub issue number to work on'
+          }
+        },
+        required: ['issue_number']
+      }
+    },
+    {
+      name: 'workflow_run_tests',
+      description: 'Run the test suite. REQUIRED after writing code, before committing.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          test_command: {
+            type: 'string',
+            description: 'Test command to run (default: npm test)',
+            default: 'npm test'
+          }
+        }
+      }
+    },
+    {
+      name: 'workflow_commit',
+      description: 'Commit code. ONLY available after tests pass.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message: {
+            type: 'string',
+            description: 'Commit message'
+          }
+        },
+        required: ['message']
+      }
+    },
+    {
+      name: 'workflow_deploy',
+      description: 'Deploy to production. ONLY available after commit.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          environment: {
+            type: 'string',
+            description: 'Environment to deploy to',
+            default: 'production'
+          }
+        }
+      }
+    },
+    {
+      name: 'workflow_verify_prod',
+      description: 'Run production verification tests. REQUIRED after deploy.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          test_command: {
+            type: 'string',
+            description: 'Production test command (default: npm run test:prod)',
+            default: 'npm run test:prod'
+          }
+        }
+      }
+    },
+    {
+      name: 'workflow_close_issue',
+      description: 'Close the GitHub issue. ONLY available after prod tests pass.',
+      inputSchema: {
+        type: 'object',
+        properties: {}
+      }
+    },
+    {
+      name: 'workflow_status',
+      description: 'Check current workflow state and what actions are available.',
+      inputSchema: {
+        type: 'object',
+        properties: {}
+      }
+    }
+  ]
+}));
+
+// Handle tool calls
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  switch (name) {
+    case 'workflow_start_issue': {
+      if (workflow.state !== 'NO_ACTIVE_ISSUE') {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Already working on issue #${workflow.activeIssue}. Close it first.`
+          }]
+        };
+      }
+
+      // Verify issue exists via GitHub CLI
+      try {
+        const issueNumber = (args as any)?.issue_number;
+        const issueData = execSync(
+          `gh issue view ${issueNumber} --json state,title`,
+          { encoding: 'utf-8', cwd: process.cwd(), timeout: 30000 }
+        );
+        const issue = JSON.parse(issueData);
+
+        if (issue.state === 'CLOSED') {
+          return {
+            content: [{
+              type: 'text',
+              text: `❌ Issue #${issueNumber} is already closed.`
+            }]
+          };
+        }
+
+        workflow.activeIssue = issueNumber;
+        workflow.state = 'ISSUE_ACTIVE';
+
+        return {
+          content: [{
+            type: 'text',
+            text: `✅ Started work on issue #${issueNumber}: ${issue.title}\n\n` +
+                  `Next step: Write your code, then run workflow_run_tests`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Failed to start issue: ${error.message}\n\n` +
+                  `Make sure the issue exists and you have GitHub CLI installed.`
+          }]
+        };
+      }
+    }
+
+    case 'workflow_run_tests': {
+      if (workflow.state === 'NO_ACTIVE_ISSUE') {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ No active issue. Use workflow_start_issue first.\n\n` +
+                  `See the 'workflow-best-practices' skill for examples.`
+          }]
+        };
+      }
+
+      const testCommand = (args as any).test_command || 'npm test';
+
+      try {
+        const output = execSync(testCommand, {
+          encoding: 'utf-8',
+          stdio: 'pipe',
+          cwd: process.cwd(),
+          timeout: 600000 // 10 minute timeout for tests
+        });
+
+        workflow.lastTestResult = { passed: true, output };
+        workflow.state = 'TESTS_PASSED';
+
+        return {
+          content: [{
+            type: 'text',
+            text: `✅ Tests passed!\n\n${truncateOutput(output)}\n\n` +
+                  `Next step: Use workflow_commit to commit your changes`
+          }]
+        };
+      } catch (error: any) {
+        workflow.lastTestResult = { passed: false, output: error.stderr };
+        workflow.state = 'TESTS_FAILED';
+
+        const errorOutput = error.stderr || error.stdout || error.message;
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Tests failed!\n\n${truncateOutput(errorOutput)}\n\n` +
+                  `Fix the issues and run workflow_run_tests again.`
+          }]
+        };
+      }
+    }
+
+    case 'workflow_commit': {
+      if (workflow.state !== 'TESTS_PASSED') {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Cannot commit. Current state: ${workflow.state}\n\n` +
+                  `Tests must pass before committing.\n` +
+                  `Run workflow_run_tests first.`
+          }]
+        };
+      }
+
+      const message = (args as any).message;
+      const commitMsg = `${message}\n\nRefs #${workflow.activeIssue}`;
+
+      try {
+        execSync(`git add -A`, { encoding: 'utf-8', cwd: process.cwd() });
+
+        // Use a safer heredoc-style commit to avoid quote escaping issues
+        execSync(`git commit -m "$(cat <<'EOF'\n${commitMsg}\nEOF\n)"`, {
+          encoding: 'utf-8',
+          cwd: process.cwd(),
+          shell: '/bin/bash'
+        });
+
+        workflow.state = 'COMMITTED';
+        workflow.commitHash = execSync('git rev-parse HEAD', {
+          encoding: 'utf-8',
+          cwd: process.cwd()
+        }).trim();
+
+        return {
+          content: [{
+            type: 'text',
+            text: `✅ Committed: ${workflow.commitHash.substring(0, 7)}\n\n` +
+                  `Message: ${message}\n` +
+                  `Issue: #${workflow.activeIssue}\n\n` +
+                  `Next step: Use workflow_deploy to deploy to production`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Commit failed: ${error.message}`
+          }]
+        };
+      }
+    }
+
+    case 'workflow_deploy': {
+      if (workflow.state !== 'COMMITTED') {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Cannot deploy. Current state: ${workflow.state}\n\n` +
+                  `You must commit before deploying.`
+          }]
+        };
+      }
+
+      const environment = (args as any).environment || 'production';
+
+      try {
+        // Look for deploy script in common locations
+        let deployCommand = '';
+
+        try {
+          execSync('test -f ./deploy.sh', { encoding: 'utf-8', cwd: process.cwd() });
+          deployCommand = './deploy.sh';
+        } catch {
+          try {
+            execSync('test -f ./scripts/deploy.sh', { encoding: 'utf-8', cwd: process.cwd() });
+            deployCommand = './scripts/deploy.sh';
+          } catch {
+            // Check package.json for deploy script
+            deployCommand = 'npm run deploy';
+          }
+        }
+
+        const output = execSync(deployCommand, {
+          encoding: 'utf-8',
+          cwd: process.cwd(),
+          timeout: 300000 // 5 minute timeout for deployment
+        });
+        workflow.state = 'DEPLOYED';
+        workflow.deploymentId = Date.now().toString();
+
+        return {
+          content: [{
+            type: 'text',
+            text: `✅ Deployed to ${environment}!\n\n` +
+                  `${truncateOutput(output)}\n\n` +
+                  `Next step: Use workflow_verify_prod to run production tests`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Deployment failed: ${error.message}\n\n` +
+                  `Make sure you have a deploy script (./deploy.sh or npm run deploy)`
+          }]
+        };
+      }
+    }
+
+    case 'workflow_verify_prod': {
+      if (workflow.state !== 'DEPLOYED') {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Cannot verify. Must deploy first.\n` +
+                  `Current state: ${workflow.state}`
+          }]
+        };
+      }
+
+      const testCommand = (args as any).test_command || 'npm run test:prod';
+
+      try {
+        const output = execSync(testCommand, {
+          encoding: 'utf-8',
+          cwd: process.cwd(),
+          timeout: 300000 // 5 minute timeout for prod tests
+        });
+        workflow.state = 'PROD_VERIFIED';
+
+        return {
+          content: [{
+            type: 'text',
+            text: `✅ Production tests passed!\n\n${truncateOutput(output)}\n\n` +
+                  `Next step: Use workflow_close_issue to close issue #${workflow.activeIssue}`
+          }]
+        };
+      } catch (error: any) {
+        const errorOutput = error.stderr || error.stdout || error.message;
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Production tests failed!\n\n${truncateOutput(errorOutput)}\n\n` +
+                  `Issue #${workflow.activeIssue} will remain open. ` +
+                  `Fix and redeploy.`
+          }]
+        };
+      }
+    }
+
+    case 'workflow_close_issue': {
+      if (workflow.state !== 'PROD_VERIFIED') {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Cannot close issue. Current state: ${workflow.state}\n\n` +
+                  `Production tests must pass first.`
+          }]
+        };
+      }
+
+      try {
+        execSync(
+          `gh issue close ${workflow.activeIssue} ` +
+          `-c "✅ Fixed and verified in production (${workflow.commitHash?.substring(0, 7)})"`,
+          { encoding: 'utf-8', cwd: process.cwd(), timeout: 30000 }
+        );
+
+        const closedIssue = workflow.activeIssue;
+
+        // Reset workflow
+        workflow = {
+          state: 'NO_ACTIVE_ISSUE',
+          activeIssue: null,
+          lastTestResult: null,
+          commitHash: null,
+          deploymentId: null
+        };
+
+        return {
+          content: [{
+            type: 'text',
+            text: `🎉 Issue #${closedIssue} closed successfully!\n\n` +
+                  `Workflow complete. Ready for next issue.`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Failed to close issue: ${error.message}\n\n` +
+                  `Make sure you have GitHub CLI installed and authenticated.`
+          }]
+        };
+      }
+    }
+
+    case 'workflow_status': {
+      const availableActions = getAvailableActions(workflow.state);
+
+      return {
+        content: [{
+          type: 'text',
+          text: `📊 Workflow Status:\n\n` +
+                `State: ${workflow.state}\n` +
+                `Active Issue: ${workflow.activeIssue || 'None'}\n` +
+                `Commit: ${workflow.commitHash?.substring(0, 7) || 'None'}\n\n` +
+                `Available actions:\n${availableActions.map(a => `  - ${a}`).join('\n')}`
+        }]
+      };
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+});
+
+function getAvailableActions(state: string): string[] {
+  const actions: Record<string, string[]> = {
+    'NO_ACTIVE_ISSUE': ['workflow_start_issue'],
+    'ISSUE_ACTIVE': ['workflow_run_tests'],
+    'TESTS_FAILED': ['workflow_run_tests (fix code first)'],
+    'TESTS_PASSED': ['workflow_commit'],
+    'COMMITTED': ['workflow_deploy'],
+    'DEPLOYED': ['workflow_verify_prod'],
+    'PROD_VERIFIED': ['workflow_close_issue']
+  };
+  return actions[state] || [];
+}
+
+// Start the server
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Workflow Enforcer MCP Server running on stdio');
+}
+
+main();

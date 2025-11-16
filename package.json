@@ -1,0 +1,19 @@
+{
+  "name": "workflow-enforcer",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server enforcing development workflow",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}
