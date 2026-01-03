@@ -80,14 +80,14 @@ Applied to all command outputs:
 ## Build Status
 
 ✅ TypeScript compilation successful
-✅ Build output: `/mnt/d/cc_build_mcp/build/index.js`
+✅ Build output: `/mnt/g/cc_build_mcp/build/index.js`
 ✅ Server tested and runs correctly
 
 ## Configuration Status
 
 ✅ Global MCP config: `/home/scarter/.claude/mcp.json`
-✅ Project MCP config: `/mnt/d/manuscript-platform/.claude/mcp.json`
-✅ Skill installed: `/mnt/d/manuscript-platform/.claude/skills/workflow-best-practices/SKILL.md`
+✅ Project MCP config: `/mnt/g/manuscript-platform/.claude/mcp.json`
+✅ Skill installed: `/mnt/g/manuscript-platform/.claude/skills/workflow-best-practices/SKILL.md`
 
 ## Next Steps
 
@@ -128,8 +128,8 @@ After restart, test the full workflow with a real issue:
 
 ## Files Modified
 
-- `/mnt/d/cc_build_mcp/src/index.ts` - Source file with all fixes
-- `/mnt/d/cc_build_mcp/build/index.js` - Rebuilt output
+- `/mnt/g/cc_build_mcp/src/index.ts` - Source file with all fixes
+- `/mnt/g/cc_build_mcp/build/index.js` - Rebuilt output
 
 ## Compatibility
 
